@@ -1,0 +1,1229 @@
+From ad4d4ecdfc8a7b7b30c6fac6912d7bdacf7b95b6 Mon Sep 17 00:00:00 2001
+From: Shiva <shivaj@uci.edu>
+Date: Thu, 11 Jul 2019 23:05:38 -0700
+Subject: [PATCH] No Grow No Steal, all vicitm selection policies are added +
+ GrowSteal hint(TODO:Grow-Steal is disabled as of now.)
+
+---
+ .../asterix/lang/sqlpp/parser/SqlppHint.java       |   2 +
+ .../asterix-lang-sqlpp/src/main/javacc/SQLPP.jj    |  12 +-
+ .../JoinGrowStealExpressionAnnotation.java         |  27 ++
+ .../JoinVictimSelectionExpressionAnnotation.java   |  44 +++
+ .../physical/HybridHashJoinPOperator.java          |  14 +-
+ .../algebricks/rewriter/util/JoinUtils.java        |  32 +-
+ .../IPartitionedTupleBufferManager.java            |   2 +
+ .../PreferToSpillFullyOccupiedFramePolicy.java     | 375 ++++++++++++++++++++-
+ .../VPartitionTupleBufferManager.java              |  32 +-
+ .../std/group/HashSpillableTableFactory.java       |   6 +-
+ .../dataflow/std/join/OptimizedHybridHashJoin.java | 100 +++++-
+ .../OptimizedHybridHashJoinOperatorDescriptor.java |  49 ++-
+ .../integration/OptimizedHybridHashJoinTest.java   |   3 +-
+ 13 files changed, 623 insertions(+), 75 deletions(-)
+ create mode 100644 hyracks-fullstack/algebricks/algebricks-core/src/main/java/org/apache/hyracks/algebricks/core/algebra/expressions/JoinGrowStealExpressionAnnotation.java
+ create mode 100644 hyracks-fullstack/algebricks/algebricks-core/src/main/java/org/apache/hyracks/algebricks/core/algebra/expressions/JoinVictimSelectionExpressionAnnotation.java
+
+diff --git a/asterixdb/asterix-lang-sqlpp/src/main/java/org/apache/asterix/lang/sqlpp/parser/SqlppHint.java b/asterixdb/asterix-lang-sqlpp/src/main/java/org/apache/asterix/lang/sqlpp/parser/SqlppHint.java
+index eac6269..bec0cd1 100644
+--- a/asterixdb/asterix-lang-sqlpp/src/main/java/org/apache/asterix/lang/sqlpp/parser/SqlppHint.java
++++ b/asterixdb/asterix-lang-sqlpp/src/main/java/org/apache/asterix/lang/sqlpp/parser/SqlppHint.java
+@@ -44,6 +44,8 @@ public enum SqlppHint {
+     MIN_BUILD_PARTITIONS_HINT("min-build-partitions"),
+     TEMP_HINT("temp"),
+     JOIN_DATA_INSERTION_HINT("data-insertion"),
++    JOIN_VICTIM_SELECTION_HINT("victim-selection"),
++    JOIN_GROWSTEAL_HINT("GrowSteal"),
+     RANGE_HINT("range"),
+     SKIP_SECONDARY_INDEX_SEARCH_HINT("skip-index"),
+     VAL_FILE_HINT("val-files"),
+diff --git a/asterixdb/asterix-lang-sqlpp/src/main/javacc/SQLPP.jj b/asterixdb/asterix-lang-sqlpp/src/main/javacc/SQLPP.jj
+index 90be85f..7be048f 100644
+--- a/asterixdb/asterix-lang-sqlpp/src/main/javacc/SQLPP.jj
++++ b/asterixdb/asterix-lang-sqlpp/src/main/javacc/SQLPP.jj
+@@ -209,6 +209,8 @@ import org.apache.hyracks.algebricks.core.algebra.expressions.JoinBuildPartition
+ import org.apache.hyracks.algebricks.core.algebra.expressions.JoinBuildSizeExpressionAnnotation;
+ import org.apache.hyracks.algebricks.core.algebra.expressions.SingleJoinMemoryExpressionAnnotation;
+ import org.apache.hyracks.algebricks.core.algebra.expressions.JoinDataInsertionExpressionAnnotation;
++import org.apache.hyracks.algebricks.core.algebra.expressions.JoinVictimSelectionExpressionAnnotation;
++import org.apache.hyracks.algebricks.core.algebra.expressions.JoinGrowStealExpressionAnnotation;
+ import org.apache.hyracks.algebricks.core.algebra.functions.FunctionIdentifier;
+ import org.apache.hyracks.api.exceptions.SourceLocation;
+ import org.apache.hyracks.api.exceptions.Warning;
+@@ -2781,7 +2783,7 @@ Expression RelExpr() throws ParseException:
+       LOOKAHEAD(2)( <LT> | <GT> | <LE> | <GE> | <EQ> | <NE> | <LG> |<SIMILAR> | (<NOT> { not = true; })? <IN>)
+         {
+           Token hintToken = fetchHint(token, SqlppHint.INDEXED_NESTED_LOOP_JOIN_HINT,
+-            SqlppHint.SKIP_SECONDARY_INDEX_SEARCH_HINT, SqlppHint.HASH_BROADCAST_JOIN_HINT, SqlppHint.SINGLE_JOIN_MEMORY, SqlppHint.BUILD_SIZE_HINT, SqlppHint.MIN_BUILD_PARTITIONS_HINT, SqlppHint.TEMP_HINT, SqlppHint.JOIN_DATA_INSERTION_HINT);
++            SqlppHint.SKIP_SECONDARY_INDEX_SEARCH_HINT, SqlppHint.HASH_BROADCAST_JOIN_HINT, SqlppHint.SINGLE_JOIN_MEMORY, SqlppHint.BUILD_SIZE_HINT, SqlppHint.MIN_BUILD_PARTITIONS_HINT, SqlppHint.TEMP_HINT, SqlppHint.JOIN_DATA_INSERTION_HINT, SqlppHint.JOIN_VICTIM_SELECTION_HINT, SqlppHint.JOIN_GROWSTEAL_HINT);
+ 
+           if (hintToken != null) {
+             int index=0;
+@@ -2811,6 +2813,14 @@ Expression RelExpr() throws ParseException:
+                     case JOIN_DATA_INSERTION_HINT:
+                         annotation = new JoinDataInsertionExpressionAnnotation(hintToken.hintParams.get(index).toUpperCase());
+                         break;
++                    case JOIN_VICTIM_SELECTION_HINT:
++                        annotation =
++                                new JoinVictimSelectionExpressionAnnotation(hintToken.hintParams.get(index).toUpperCase());
++                        break;
++                    case JOIN_GROWSTEAL_HINT:
++                        annotation = JoinGrowStealExpressionAnnotation.INSTANCE;
++                        break;
++
+                 }
+                 if (annotation != null ){
+                 annotations.add(annotation);
+diff --git a/hyracks-fullstack/algebricks/algebricks-core/src/main/java/org/apache/hyracks/algebricks/core/algebra/expressions/JoinGrowStealExpressionAnnotation.java b/hyracks-fullstack/algebricks/algebricks-core/src/main/java/org/apache/hyracks/algebricks/core/algebra/expressions/JoinGrowStealExpressionAnnotation.java
+new file mode 100644
+index 0000000..7619825
+--- /dev/null
++++ b/hyracks-fullstack/algebricks/algebricks-core/src/main/java/org/apache/hyracks/algebricks/core/algebra/expressions/JoinGrowStealExpressionAnnotation.java
+@@ -0,0 +1,27 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.hyracks.algebricks.core.algebra.expressions;
++
++public class JoinGrowStealExpressionAnnotation implements IExpressionAnnotation {
++    public static final JoinGrowStealExpressionAnnotation INSTANCE = new JoinGrowStealExpressionAnnotation();
++
++    public JoinGrowStealExpressionAnnotation() {
++    }
++
++}
+diff --git a/hyracks-fullstack/algebricks/algebricks-core/src/main/java/org/apache/hyracks/algebricks/core/algebra/expressions/JoinVictimSelectionExpressionAnnotation.java b/hyracks-fullstack/algebricks/algebricks-core/src/main/java/org/apache/hyracks/algebricks/core/algebra/expressions/JoinVictimSelectionExpressionAnnotation.java
+new file mode 100644
+index 0000000..fc171c5
+--- /dev/null
++++ b/hyracks-fullstack/algebricks/algebricks-core/src/main/java/org/apache/hyracks/algebricks/core/algebra/expressions/JoinVictimSelectionExpressionAnnotation.java
+@@ -0,0 +1,44 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.hyracks.algebricks.core.algebra.expressions;
++
++import org.apache.hyracks.dataflow.std.buffermanager.PreferToSpillFullyOccupiedFramePolicy;
++
++public class JoinVictimSelectionExpressionAnnotation implements IExpressionAnnotation {
++    public static final String HINT_STRING = "victim-selection";
++    PreferToSpillFullyOccupiedFramePolicy.VICTIM victim;
++
++    public PreferToSpillFullyOccupiedFramePolicy.VICTIM getVictim() {
++        return victim;
++    }
++
++    public JoinVictimSelectionExpressionAnnotation() {
++        victim = PreferToSpillFullyOccupiedFramePolicy.VICTIM.LARGEST_SIZE_SELF;
++    }
++
++    public JoinVictimSelectionExpressionAnnotation(String insertion) {
++        String[] splits = insertion.split(" +");
++        this.victim = PreferToSpillFullyOccupiedFramePolicy.VICTIM.valueOf(splits[0]);
++
++    }
++
++    public String toString() {
++        return HINT_STRING + "=" + victim;
++    }
++}
+diff --git a/hyracks-fullstack/algebricks/algebricks-core/src/main/java/org/apache/hyracks/algebricks/core/algebra/operators/physical/HybridHashJoinPOperator.java b/hyracks-fullstack/algebricks/algebricks-core/src/main/java/org/apache/hyracks/algebricks/core/algebra/operators/physical/HybridHashJoinPOperator.java
+index 202d245..f345869 100644
+--- a/hyracks-fullstack/algebricks/algebricks-core/src/main/java/org/apache/hyracks/algebricks/core/algebra/operators/physical/HybridHashJoinPOperator.java
++++ b/hyracks-fullstack/algebricks/algebricks-core/src/main/java/org/apache/hyracks/algebricks/core/algebra/operators/physical/HybridHashJoinPOperator.java
+@@ -51,6 +51,7 @@ import org.apache.hyracks.api.dataflow.value.IPredicateEvaluatorFactoryProvider;
+ import org.apache.hyracks.api.dataflow.value.ITuplePairComparatorFactory;
+ import org.apache.hyracks.api.dataflow.value.RecordDescriptor;
+ import org.apache.hyracks.api.job.IOperatorDescriptorRegistry;
++import org.apache.hyracks.dataflow.std.buffermanager.PreferToSpillFullyOccupiedFramePolicy;
+ import org.apache.hyracks.dataflow.std.buffermanager.VPartitionTupleBufferManager;
+ import org.apache.hyracks.dataflow.std.join.OptimizedHybridHashJoinOperatorDescriptor;
+ import org.apache.logging.log4j.LogManager;
+@@ -64,13 +65,16 @@ public class HybridHashJoinPOperator extends AbstractHashJoinPOperator {
+     private final int minPartitionsForBuild;
+     private VPartitionTupleBufferManager.INSERTION insertion;
+     private double[] insertionParams;
++    private PreferToSpillFullyOccupiedFramePolicy.VICTIM victim;
++    private boolean GrowSteal;
+ 
+     private static final Logger LOGGER = LogManager.getLogger();
+ 
+     public HybridHashJoinPOperator(JoinKind kind, JoinPartitioningType partitioningType,
+             List<LogicalVariable> sideLeftOfEqualities, List<LogicalVariable> sideRightOfEqualities,
+             int userSuggestedMemorySize, int maxInputSizeInFrames, int minBuildPartitions, int aveRecordsPerFrame,
+-            double fudgeFactor, VPartitionTupleBufferManager.INSERTION insertion, double[] insertionParams) {
++            double fudgeFactor, VPartitionTupleBufferManager.INSERTION insertion, double[] insertionParams,
++            PreferToSpillFullyOccupiedFramePolicy.VICTIM victim, boolean GrowSteal) {
+         super(kind, partitioningType, sideLeftOfEqualities, sideRightOfEqualities);
+         this.maxInputBuildSizeInFrames = maxInputSizeInFrames;
+         this.userSuggestedMemorySize = userSuggestedMemorySize;
+@@ -78,6 +82,9 @@ public class HybridHashJoinPOperator extends AbstractHashJoinPOperator {
+         this.fudgeFactor = fudgeFactor;
+         this.insertion = insertion;
+         this.insertionParams = insertionParams;
++        this.victim = victim;
++        this.GrowSteal = GrowSteal;
++
+         if (LOGGER.isTraceEnabled()) {
+             LOGGER.trace("HybridHashJoinPOperator constructed with: JoinKind=" + kind + ", JoinPartitioningType="
+                     + partitioningType + ", List<LogicalVariable>=" + sideLeftOfEqualities + ", List<LogicalVariable>="
+@@ -162,7 +169,7 @@ public class HybridHashJoinPOperator extends AbstractHashJoinPOperator {
+                 return new OptimizedHybridHashJoinOperatorDescriptor(spec, memSizeInFrames, maxInputBuildSizeInFrames,
+                         minPartitionsForBuild, getFudgeFactor(), keysLeft, keysRight, leftHashFunFamilies,
+                         rightHashFunFamilies, recDescriptor, comparatorFactory, reverseComparatorFactory,
+-                        predEvaluatorFactory, insertion, insertionParams);
++                        predEvaluatorFactory, insertion, insertionParams, victim, GrowSteal);
+             case LEFT_OUTER:
+                 IMissingWriterFactory[] nonMatchWriterFactories = new IMissingWriterFactory[inputSchemas[1].getSize()];
+                 for (int j = 0; j < nonMatchWriterFactories.length; j++) {
+@@ -171,7 +178,8 @@ public class HybridHashJoinPOperator extends AbstractHashJoinPOperator {
+                 return new OptimizedHybridHashJoinOperatorDescriptor(spec, memSizeInFrames, maxInputBuildSizeInFrames,
+                         minPartitionsForBuild, getFudgeFactor(), keysLeft, keysRight, leftHashFunFamilies,
+                         rightHashFunFamilies, recDescriptor, comparatorFactory, reverseComparatorFactory,
+-                        predEvaluatorFactory, true, nonMatchWriterFactories, insertion, insertionParams);
++                        predEvaluatorFactory, true, nonMatchWriterFactories, insertion, insertionParams, victim,
++                        GrowSteal);
+             default:
+                 throw new NotImplementedException();
+         }
+diff --git a/hyracks-fullstack/algebricks/algebricks-rewriter/src/main/java/org/apache/hyracks/algebricks/rewriter/util/JoinUtils.java b/hyracks-fullstack/algebricks/algebricks-rewriter/src/main/java/org/apache/hyracks/algebricks/rewriter/util/JoinUtils.java
+index 393fb0c..5b9e2f6 100644
+--- a/hyracks-fullstack/algebricks/algebricks-rewriter/src/main/java/org/apache/hyracks/algebricks/rewriter/util/JoinUtils.java
++++ b/hyracks-fullstack/algebricks/algebricks-rewriter/src/main/java/org/apache/hyracks/algebricks/rewriter/util/JoinUtils.java
+@@ -35,6 +35,8 @@ import org.apache.hyracks.algebricks.core.algebra.expressions.BroadcastExpressio
+ import org.apache.hyracks.algebricks.core.algebra.expressions.JoinBuildPartitionExpressionAnnotation;
+ import org.apache.hyracks.algebricks.core.algebra.expressions.JoinBuildSizeExpressionAnnotation;
+ import org.apache.hyracks.algebricks.core.algebra.expressions.JoinDataInsertionExpressionAnnotation;
++import org.apache.hyracks.algebricks.core.algebra.expressions.JoinGrowStealExpressionAnnotation;
++import org.apache.hyracks.algebricks.core.algebra.expressions.JoinVictimSelectionExpressionAnnotation;
+ import org.apache.hyracks.algebricks.core.algebra.expressions.SingleJoinMemoryExpressionAnnotation;
+ import org.apache.hyracks.algebricks.core.algebra.expressions.VariableReferenceExpression;
+ import org.apache.hyracks.algebricks.core.algebra.functions.AlgebricksBuiltinFunctions;
+@@ -53,6 +55,7 @@ import org.apache.hyracks.api.exceptions.ErrorCode;
+ import org.apache.hyracks.api.exceptions.IWarningCollector;
+ import org.apache.hyracks.api.exceptions.SourceLocation;
+ import org.apache.hyracks.api.exceptions.Warning;
++import org.apache.hyracks.dataflow.std.buffermanager.PreferToSpillFullyOccupiedFramePolicy;
+ import org.apache.hyracks.dataflow.std.buffermanager.VPartitionTupleBufferManager;
+ 
+ public class JoinUtils {
+@@ -72,8 +75,10 @@ public class JoinUtils {
+         int buildSize = 0;
+         int minBuildPartition = 0;
+         VPartitionTupleBufferManager.INSERTION insertion = VPartitionTupleBufferManager.INSERTION.APPEND;
++        PreferToSpillFullyOccupiedFramePolicy.VICTIM victim = PreferToSpillFullyOccupiedFramePolicy.VICTIM.LARGEST_SIZE;
+         double[] insertionParams = new double[2];
+         ILogicalExpression cond = op.getCondition().getValue();
++        boolean GrowSteal = false;
+         if (cond.getExpressionTag() == LogicalExpressionTag.FUNCTION_CALL) {
+             AbstractFunctionCallExpression fcond = (AbstractFunctionCallExpression) cond;
+             if (fcond.hasAnnotations()) {
+@@ -91,6 +96,12 @@ public class JoinUtils {
+                     insertion = fcond.getAnnotation(JoinDataInsertionExpressionAnnotation.class).getInsertion();
+                     insertionParams = fcond.getAnnotation(JoinDataInsertionExpressionAnnotation.class).getParams();
+                 }
++                if (fcond.hasAnnotation(JoinVictimSelectionExpressionAnnotation.class)) {
++                    victim = fcond.getAnnotation(JoinVictimSelectionExpressionAnnotation.class).getVictim();
++                }
++                if (fcond.hasAnnotation(JoinGrowStealExpressionAnnotation.class)) {
++                    GrowSteal = true;
++                }
+ 
+             } else {
+                 for (Mutable<ILogicalExpression> arg : fcond.getArguments()) {
+@@ -113,6 +124,14 @@ public class JoinUtils {
+                                 insertionParams =
+                                         argcond.getAnnotation(JoinDataInsertionExpressionAnnotation.class).getParams();
+                             }
++                            if (argcond.hasAnnotation(JoinVictimSelectionExpressionAnnotation.class)) {
++                                victim = argcond.getAnnotation(JoinVictimSelectionExpressionAnnotation.class)
++                                        .getVictim();
++                            }
++                            if (argcond.hasAnnotation(JoinGrowStealExpressionAnnotation.class)) {
++                                GrowSteal = true;
++                            }
++
+                         }
+                     }
+                 }
+@@ -123,12 +142,12 @@ public class JoinUtils {
+             BroadcastSide side = getBroadcastJoinSide(conditionExpr);
+             if (side == null) {
+                 setHashJoinOp(op, JoinPartitioningType.PAIRWISE, sideLeft, sideRight, context, joinMem, buildSize,
+-                        minBuildPartition, insertion, insertionParams);
++                        minBuildPartition, insertion, insertionParams, victim, GrowSteal);
+             } else {
+                 switch (side) {
+                     case RIGHT:
+                         setHashJoinOp(op, JoinPartitioningType.BROADCAST, sideLeft, sideRight, context, joinMem,
+-                                buildSize, minBuildPartition, insertion, insertionParams);
++                                buildSize, minBuildPartition, insertion, insertionParams, victim, GrowSteal);
+                         break;
+                     case LEFT:
+                         if (op.getJoinKind() == AbstractBinaryJoinOperator.JoinKind.INNER) {
+@@ -138,10 +157,10 @@ public class JoinUtils {
+                             opRef0.setValue(opRef1.getValue());
+                             opRef1.setValue(tmp);
+                             setHashJoinOp(op, JoinPartitioningType.BROADCAST, sideRight, sideLeft, context, joinMem,
+-                                    buildSize, minBuildPartition, insertion, insertionParams);
++                                    buildSize, minBuildPartition, insertion, insertionParams, victim, GrowSteal);
+                         } else {
+                             setHashJoinOp(op, JoinPartitioningType.PAIRWISE, sideLeft, sideRight, context, joinMem,
+-                                    buildSize, minBuildPartition, insertion, insertionParams);
++                                    buildSize, minBuildPartition, insertion, insertionParams, victim, GrowSteal);
+                         }
+                         break;
+                     default:
+@@ -163,14 +182,15 @@ public class JoinUtils {
+     private static void setHashJoinOp(AbstractBinaryJoinOperator op, JoinPartitioningType partitioningType,
+             List<LogicalVariable> sideLeft, List<LogicalVariable> sideRight, IOptimizationContext context, int joinMem,
+             int buildSize, int minBuildPartitions, VPartitionTupleBufferManager.INSERTION insertion,
+-            double[] insertionParams) {
++            double[] insertionParams, PreferToSpillFullyOccupiedFramePolicy.VICTIM victim, boolean GrowSteal) {
+ 
+         op.setPhysicalOperator(new HybridHashJoinPOperator(op.getJoinKind(), partitioningType, sideLeft, sideRight,
+                 context.getPhysicalOptimizationConfig().getMaxFramesForJoin(joinMem),
+                 context.getPhysicalOptimizationConfig().getMaxFramesForJoinLeftInput(buildSize),
+                 context.getPhysicalOptimizationConfig().getBuildPartition(minBuildPartitions),
+                 context.getPhysicalOptimizationConfig().getMaxRecordsPerFrame(),
+-                context.getPhysicalOptimizationConfig().getFudgeFactor(), insertion, insertionParams));
++                context.getPhysicalOptimizationConfig().getFudgeFactor(), insertion, insertionParams, victim,
++                GrowSteal));
+     }
+ 
+     public static boolean hybridToInMemHashJoin(AbstractBinaryJoinOperator op, IOptimizationContext context)
+diff --git a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/IPartitionedTupleBufferManager.java b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/IPartitionedTupleBufferManager.java
+index b4abd2c..d60b54c 100644
+--- a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/IPartitionedTupleBufferManager.java
++++ b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/IPartitionedTupleBufferManager.java
+@@ -33,6 +33,8 @@ public interface IPartitionedTupleBufferManager {
+ 
+     int getPhysicalSize(int partition);
+ 
++    int getNumberOfFrames(int pid);
++
+     /**
+      * Insert tuple from (byte[] byteArray,int[] fieldEndOffsets, int start, int size) into
+      * specified partition. The handle is written into the tuplepointer.
+diff --git a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/PreferToSpillFullyOccupiedFramePolicy.java b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/PreferToSpillFullyOccupiedFramePolicy.java
+index 12985c0..2b03ef0 100644
+--- a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/PreferToSpillFullyOccupiedFramePolicy.java
++++ b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/PreferToSpillFullyOccupiedFramePolicy.java
+@@ -20,6 +20,11 @@
+ package org.apache.hyracks.dataflow.std.buffermanager;
+ 
+ import java.util.BitSet;
++import java.util.LinkedList;
++import java.util.List;
++import java.util.Map;
++import java.util.Random;
++import java.util.TreeMap;
+ import java.util.function.IntUnaryOperator;
+ 
+ /**
+@@ -28,12 +33,36 @@ import java.util.function.IntUnaryOperator;
+  */
+ public class PreferToSpillFullyOccupiedFramePolicy {
+ 
++    VICTIM victim;
++
++    public enum VICTIM {
++        LARGEST_RECORD,
++        LARGEST_SIZE,
++        SMALLEST_RECORD,
++        SMALLEST_SIZE,
++        MEDIAN_RECORD,
++        MEDIAN_SIZE,
++        MAX_SIZE_MIN_RECORD,
++        RANDOM,
++        HALF_EMPTY,
++        LARGEST_RECORD_SELF,
++        LARGEST_SIZE_SELF,
++        SMALLEST_RECORD_SELF,
++        SMALLEST_SIZE_SELF,
++        MEDIAN_RECORD_SELF,
++        MEDIAN_SIZE_SELF,
++        MAX_SIZE_MIN_RECORD_SELF,
++        RANDOM_SELF
++    }
++
+     private final IPartitionedTupleBufferManager bufferManager;
+     private final BitSet spilledStatus;
+ 
+-    public PreferToSpillFullyOccupiedFramePolicy(IPartitionedTupleBufferManager bufferManager, BitSet spilledStatus) {
++    public PreferToSpillFullyOccupiedFramePolicy(IPartitionedTupleBufferManager bufferManager, BitSet spilledStatus,
++            PreferToSpillFullyOccupiedFramePolicy.VICTIM victim) {
+         this.bufferManager = bufferManager;
+         this.spilledStatus = spilledStatus;
++        this.victim = victim;
+     }
+ 
+     /**
+@@ -45,11 +74,11 @@ public class PreferToSpillFullyOccupiedFramePolicy {
+      * Note: right now, the createAtMostOneFrameForSpilledPartitionConstrain we are using for a spilled partition
+      * enforces that the number of maximum frame for a spilled partition is 1.
+      */
+-    public int selectVictimPartition(int failedToInsertPartition) {
++    public int selectVictimPartition(int failedToInsertPartition, long remaining) {
+         // To avoid flushing another partition with the last half-full frame, it's better to spill the given partition
+         // since one partition needs to be spilled to the disk anyway. Another reason is that we know that
+         // the last frame in this partition is full.
+-        if (bufferManager.getNumTuples(failedToInsertPartition) > 0) {
++        if (spilledStatus.get(failedToInsertPartition) && bufferManager.getNumTuples(failedToInsertPartition) > 0) {
+             return failedToInsertPartition;
+         }
+         // If the given partition doesn't contain any tuple in memory, try to flush a different in-memory partition.
+@@ -57,7 +86,148 @@ public class PreferToSpillFullyOccupiedFramePolicy {
+         // have only one frame and we don't know whether the frame is fully occupied or not.
+         // TODO: Once we change this policy (spilled partition can have only one frame in memory),
+         //       we need to revise this method, too.
+-        return findInMemPartitionWithMaxMemoryUsage();
++        if (remaining > 0) {
++            return findBestMatchInMemory(remaining);
++        }
++        switch (victim) {
++            case HALF_EMPTY:
++                return findInMemPartitionWithHalfEmptyAlgorithm();
++            case LARGEST_SIZE_SELF: {
++                if (bufferManager.getNumTuples(failedToInsertPartition) > 0) {
++                    return failedToInsertPartition;
++                }
++                return findInMemPartitionWithMaxMemoryUsage();
++            }
++            case LARGEST_RECORD_SELF: {
++                if (bufferManager.getNumTuples(failedToInsertPartition) > 0) {
++                    return failedToInsertPartition;
++                }
++                return findInMemPartitionWithMaxNumberOfRecords();
++            }
++            case SMALLEST_SIZE_SELF: {
++                if (bufferManager.getNumTuples(failedToInsertPartition) > 0) {
++                    return failedToInsertPartition;
++                }
++                return findInMemPartitionWithMinMemoryUsage();
++            }
++            case SMALLEST_RECORD_SELF: {
++                if (bufferManager.getNumTuples(failedToInsertPartition) > 0) {
++                    return failedToInsertPartition;
++                }
++                return findInMemPartitionWithMinNumberOfRecords();
++
++            }
++            case MEDIAN_SIZE_SELF: {
++                if (bufferManager.getNumTuples(failedToInsertPartition) > 0) {
++                    return failedToInsertPartition;
++                }
++                return findInMemPartitionWithMedianSize();
++            }
++            case MEDIAN_RECORD_SELF: {
++                if (bufferManager.getNumTuples(failedToInsertPartition) > 0) {
++                    return failedToInsertPartition;
++                }
++                return findInMemPartitionWithMedianRecord();
++            }
++            case RANDOM_SELF: {
++                if (bufferManager.getNumTuples(failedToInsertPartition) > 0) {
++                    return failedToInsertPartition;
++                }
++                return findInMemPartitionRandom();
++            }
++            case MAX_SIZE_MIN_RECORD_SELF: {
++                if (bufferManager.getNumTuples(failedToInsertPartition) > 0) {
++                    return failedToInsertPartition;
++                }
++                return findInMemPartitionWithMaxSizeToMinRecord();
++            }
++            //            case MIN_SIZE_MAX_RECORD_SELF: {
++            //                if (bufferManager.getNumTuples(failedToInsertPartition) > 0) {
++            //                    return failedToInsertPartition;
++            //                }
++            //                return findInMemPartitionWithMinSizeToMaxRecord();
++            //            }
++            case LARGEST_SIZE:
++                if (spilledStatus.get(failedToInsertPartition)
++                        && bufferManager.getNumTuples(failedToInsertPartition) > 0) {
++                    return failedToInsertPartition;
++                }
++                return findInMemPartitionWithMaxMemoryUsage();
++            case LARGEST_RECORD:
++                if (spilledStatus.get(failedToInsertPartition)
++                        && bufferManager.getNumTuples(failedToInsertPartition) > 0) {
++                    return failedToInsertPartition;
++                }
++                return findInMemPartitionWithMaxNumberOfRecords();
++            case SMALLEST_SIZE:
++                if (spilledStatus.get(failedToInsertPartition)
++                        && bufferManager.getNumTuples(failedToInsertPartition) > 0) {
++                    return failedToInsertPartition;
++                }
++                return findInMemPartitionWithMinMemoryUsage();
++            case SMALLEST_RECORD:
++                if (spilledStatus.get(failedToInsertPartition)
++                        && bufferManager.getNumTuples(failedToInsertPartition) > 0) {
++                    return failedToInsertPartition;
++                }
++                return findInMemPartitionWithMinNumberOfRecords();
++            case MEDIAN_SIZE:
++                if (spilledStatus.get(failedToInsertPartition)
++                        && bufferManager.getNumTuples(failedToInsertPartition) > 0) {
++                    return failedToInsertPartition;
++                }
++                return findInMemPartitionWithMedianSize();
++            case MEDIAN_RECORD:
++                if (spilledStatus.get(failedToInsertPartition)
++                        && bufferManager.getNumTuples(failedToInsertPartition) > 0) {
++                    return failedToInsertPartition;
++                }
++                return findInMemPartitionWithMedianRecord();
++            case RANDOM:
++                if (spilledStatus.get(failedToInsertPartition)
++                        && bufferManager.getNumTuples(failedToInsertPartition) > 0) {
++                    return failedToInsertPartition;
++                }
++                return findInMemPartitionRandom();
++            case MAX_SIZE_MIN_RECORD:
++                if (spilledStatus.get(failedToInsertPartition)
++                        && bufferManager.getNumTuples(failedToInsertPartition) > 0) {
++                    return failedToInsertPartition;
++                }
++                return findInMemPartitionWithMaxSizeToMinRecord();
++            //            case MIN_SIZE_MAX_RECORD:
++            //                if (spilledStatus.get(failedToInsertPartition)
++            //                        && bufferManager.getNumTuples(failedToInsertPartition) > 0) {
++            //                    return failedToInsertPartition;
++            //                }
++            //                return findInMemPartitionWithMinSizeToMaxRecord();
++
++            default:
++                if (spilledStatus.get(failedToInsertPartition)
++                        && bufferManager.getNumTuples(failedToInsertPartition) > 0) {
++                    return failedToInsertPartition;
++                }
++                return findInMemPartitionWithMaxMemoryUsage();
++
++        }
++    }
++
++    public int selectSpilledVictimPartition(int failedToInsertPartition, int frameSize) {
++        if (bufferManager.getNumTuples(failedToInsertPartition) > 0
++                && bufferManager.getPhysicalSize(failedToInsertPartition) > frameSize
++                && spilledStatus.get(failedToInsertPartition)) {
++            return failedToInsertPartition;
++        }
++
++        int biggestSpilled = findSpilledPartitionWithMaxMemoryUsage();
++        if (biggestSpilled >= 0 && bufferManager.getPhysicalSize(biggestSpilled) > frameSize) {
++            return biggestSpilled;
++        }
++        return -1;
++    }
++
++    public int findInMemPartitionWithMinMemoryUsage() {//Size based
++        return findMinSize(spilledStatus.nextClearBit(0), (i) -> spilledStatus.nextClearBit(i + 1));
+     }
+ 
+     public int findInMemPartitionWithMaxMemoryUsage() {
+@@ -68,6 +238,203 @@ public class PreferToSpillFullyOccupiedFramePolicy {
+         return findMaxSize(spilledStatus.nextSetBit(0), (i) -> spilledStatus.nextSetBit(i + 1));
+     }
+ 
++    public int findInMemPartitionWithMaxNumberOfRecords() {
++        return findMaxRecord(spilledStatus.nextClearBit(0), i -> spilledStatus.nextClearBit(i + 1));
++    }
++
++    public int findInMemPartitionWithMinNumberOfRecords() {
++        return findMinRecord(spilledStatus.nextClearBit(0), i -> spilledStatus.nextClearBit(i + 1));
++    }
++
++    public int findInMemPartitionWithMedianSize() {
++        return findMedianSize(spilledStatus.nextClearBit(0), i -> spilledStatus.nextClearBit(i + 1));
++    }
++
++    public int findInMemPartitionWithMedianRecord() {
++        return findMedianRecord(spilledStatus.nextClearBit(0), i -> spilledStatus.nextClearBit(i + 1));
++    }
++
++    public int findInMemPartitionWithMaxSizeToMinRecord() {
++        return findMaxSizeToMinRecord(spilledStatus.nextClearBit(0), i -> spilledStatus.nextClearBit(i + 1));
++    }
++
++    public int findInMemPartitionWithHalfEmptyAlgorithm() {
++        if (spilledStatus.cardinality() <= spilledStatus.length() / 2) {
++            return findInMemPartitionWithMinMemoryUsage();
++        }
++        return findInMemPartitionWithMaxMemoryUsage();
++    }
++
++    public int findInMemPartitionWithMinSizeToMaxRecord() {
++        return findMinSizeToMaxRecord(spilledStatus.nextClearBit(0), i -> spilledStatus.nextClearBit(i + 1));
++    }
++    //Median
++
++    public int findInMemPartitionRandom() {
++        Random random = new Random();
++        int randNum = random.nextInt(bufferManager.getNumPartitions());
++        return findRand(randNum, i -> spilledStatus.nextClearBit(i + 1));
++    }
++
++    private int findBestMatchInMemory(long remaining) {
++        int pid = -1;
++        long diff = Long.MAX_VALUE;
++        for (int i = spilledStatus.nextClearBit(0); i >= 0 && i < bufferManager.getNumPartitions(); i =
++                spilledStatus.nextClearBit(i + 1)) {
++            int pSize = bufferManager.getPhysicalSize(i);
++            long pDiff = pSize - remaining;
++            if (pSize >= remaining && pDiff < diff) {
++                pid = i;
++                diff = pDiff;
++            }
++        }
++        if (pid >= 0) {
++            return pid;
++        }
++        return findInMemPartitionWithMinMemoryUsage();
++    }
++
++    private int findMaxSizeToMinRecord(int startIndex, IntUnaryOperator nextIndexOp) {
++        double max = -1;
++        int pid = -1;
++        for (int i = startIndex; i >= 0 && i < bufferManager.getNumPartitions(); i = nextIndexOp.applyAsInt(i)) {
++            int numberOfRecords = bufferManager.getNumTuples(i);
++            int size = bufferManager.getPhysicalSize(i);
++            if (numberOfRecords == 0)
++                continue;
++            double ratio = (size * 1.0) / (numberOfRecords * 1.0);
++            if (ratio > max) {
++                max = ratio;
++                pid = i;
++            }
++        }
++        return pid;
++    }
++
++    private int findMinSizeToMaxRecord(int startIndex, IntUnaryOperator nextIndexOp) {
++        double min = Double.MIN_VALUE;
++        int pid = -1;
++        for (int i = startIndex; i >= 0 && i < bufferManager.getNumPartitions(); i = nextIndexOp.applyAsInt(i)) {
++            int numberOfRecords = bufferManager.getNumTuples(i);
++            int size = bufferManager.getPhysicalSize(i);
++            if (numberOfRecords == 0)
++                continue;
++            double ratio = (size * 1.0) / (numberOfRecords * 1.0);
++            if (ratio < min) {
++                min = ratio;
++                pid = i;
++            }
++        }
++        return pid;
++    }
++
++    private int findRand(int startIndex, IntUnaryOperator nextIndexOp) {
++
++        int numberOfInMemoryPartitions = bufferManager.getNumPartitions() - spilledStatus.cardinality();
++        int checked = 0;
++        int i = nextIndexOp.applyAsInt(startIndex);
++        while (checked < numberOfInMemoryPartitions) {
++            if (bufferManager.getNumTuples(i) > 1) {
++                return i;
++            }
++            i = nextIndexOp.applyAsInt(i);
++            checked++;
++        }
++        return -1;
++    }
++
++    private int findMedianSize(int startIndex, IntUnaryOperator nextIndexOp) {
++        TreeMap<Integer, List<Integer>> sizeToPid = new TreeMap<>();
++        int medCounter = 0;//number of in memory partitions
++        for (int i = startIndex; i >= 0 && i < bufferManager.getNumPartitions(); i = nextIndexOp.applyAsInt(i)) {
++            medCounter++;
++            int size = bufferManager.getPhysicalSize(i);
++            if (!sizeToPid.containsKey(size)) {
++                List<Integer> vals = new LinkedList<>();
++                sizeToPid.put(size, vals);
++            }
++            sizeToPid.get(size).add(i);
++        }
++        int counter = 0;
++        for (Map.Entry<Integer, List<Integer>> entry : sizeToPid.entrySet()) {
++            List<Integer> vals = entry.getValue();
++            for (Integer v : vals) {
++                if (counter == medCounter)
++                    return v;
++                else
++                    counter++;
++            }
++        }
++        return -1;
++    }
++
++    private int findMedianRecord(int startIndex, IntUnaryOperator nextIndexOp) {
++        TreeMap<Integer, List<Integer>> sizeToPid = new TreeMap<>();
++        int medCounter = 0;//number of in memory partitions
++        for (int i = startIndex; i >= 0 && i < bufferManager.getNumPartitions(); i = nextIndexOp.applyAsInt(i)) {
++            medCounter++;
++            int size = bufferManager.getNumTuples(i);
++            if (!sizeToPid.containsKey(size)) {
++                List<Integer> vals = new LinkedList<>();
++                sizeToPid.put(size, vals);
++            }
++            sizeToPid.get(size).add(i);
++        }
++        int counter = 0;
++        for (Map.Entry<Integer, List<Integer>> entry : sizeToPid.entrySet()) {
++            List<Integer> vals = entry.getValue();
++            for (Integer v : vals) {
++                if (counter == medCounter)
++                    return v;
++                else
++                    counter++;
++            }
++        }
++        return -1;
++    }
++
++    private int findMaxRecord(int startIndex, IntUnaryOperator nextIndexOp) {
++        int pid = -1;
++        int max = -1;
++        for (int i = startIndex; i >= 0 && i < bufferManager.getNumPartitions(); i = nextIndexOp.applyAsInt(i)) {
++            //This is the total number of tuples (in memory and in disk), but it works for us cause we are calling
++            // this method only on in memory partitions, so it will returns the number of tuples in memory for that
++            // partition.
++            int numberOfRecords = bufferManager.getNumTuples(i);
++            if (numberOfRecords > max) {
++                max = numberOfRecords;
++                pid = i;
++            }
++        }
++        return pid;
++    }
++
++    private int findMinRecord(int startIndex, IntUnaryOperator nextIndexOp) {
++        int pid = -1;
++        int min = Integer.MAX_VALUE;
++        for (int i = startIndex; i >= 0 && i < bufferManager.getNumPartitions(); i = nextIndexOp.applyAsInt(i)) {
++            int numberOfRecords = bufferManager.getNumTuples(i);
++            if (numberOfRecords > 0 && numberOfRecords < min) {
++                min = numberOfRecords;
++                pid = i;
++            }
++        }
++        return pid;
++    }
++
++    private int findMinSize(int startIndex, IntUnaryOperator nextIndexOp) {
++        int pid = -1;
++        int min = Integer.MAX_VALUE;
++        for (int i = startIndex; i >= 0 && i < bufferManager.getNumPartitions(); i = nextIndexOp.applyAsInt(i)) {
++            int partSize = bufferManager.getPhysicalSize(i);
++            if (partSize > 0 && partSize < min) {
++                min = partSize;
++                pid = i;
++            }
++        }
++        return pid;
++    }
++
+     private int findMaxSize(int startIndex, IntUnaryOperator nextIndexOp) {
+         int pid = -1;
+         int max = 0;
+diff --git a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/VPartitionTupleBufferManager.java b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/VPartitionTupleBufferManager.java
+index 0c6ae40..e41f088 100644
+--- a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/VPartitionTupleBufferManager.java
++++ b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/VPartitionTupleBufferManager.java
+@@ -132,7 +132,6 @@ public class VPartitionTupleBufferManager implements IPartitionedTupleBufferMana
+ 
+     public int getNumberOfFrames(int pid) {
+         return partitionArray[pid].getNumFrames();
+-
+     }
+ 
+     @Override
+@@ -201,8 +200,14 @@ public class VPartitionTupleBufferManager implements IPartitionedTupleBufferMana
+         all.append("\"Collective_Fullness(inMemoryFrames)(%)\" : " + collectiveFullnessForSpilled + ",\n");
+         all.append("\"Partitions_Fullness(inMemoryFrames)(%)\" : [\n");
+         boolean needsComma = false;
++        long numOfInMemRecords = 0;
++        long numOfSpilledRecords = 0;
++        long inMemoryPhysicalSize = 0;
++        long spilledPhysicalSize = 0;
+         for (int p = 0; p < getNumPartitions(); p++) {
+             if (spilledStatus.get(p)) {
++                spilledPhysicalSize += getPhysicalSize(p);
++                numOfSpilledRecords += getNumTuples(p);
+                 if (partitionFullness[p] != -1) {
+                     if (needsComma) {
+                         all.append(",\n");
+@@ -210,6 +215,9 @@ public class VPartitionTupleBufferManager implements IPartitionedTupleBufferMana
+                     needsComma = true;
+                     all.append("{\"Partition " + p + "\" : " + partitionFullness[p] + "\n }");
+                 }
++            } else {
++                inMemoryPhysicalSize += getPhysicalSize(p);
++                numOfInMemRecords += getNumTuples(p);
+             }
+         }
+         all.append("\n]\n");
+@@ -262,8 +270,9 @@ public class VPartitionTupleBufferManager implements IPartitionedTupleBufferMana
+         //LOGGER.debug(all.toString());
+ 
+         csv.append(collectiveFullnessForSpilled + "," + collectiveFullnessInMemory + "," + spilledFrames + ","
+-                + inMemoryFrames + "," + spilledStatus.cardinality() + "," + gap + "," + totalFramesChecked + "," + -1);
+-        //LOGGER.debug(csv.toString());
++                + inMemoryFrames + "," + spilledStatus.cardinality() + "," + gap + "," + totalFramesChecked + "," + -1
++                + spilledPhysicalSize + "," + numOfSpilledRecords + "," + inMemoryPhysicalSize + ","
++                + numOfInMemRecords);
+         return csv.toString();
+ 
+     }
+@@ -346,8 +355,6 @@ public class VPartitionTupleBufferManager implements IPartitionedTupleBufferMana
+             switch (dataInsertion) {
+                 case APPEND:
+                     fid = getLastNBuffersOrCreateNewIfNotExist(partition, actualSize, (int) this.insertionParams[0]);
+-                    //number
+-                    // of frames to check
+                     break;
+                 case BESTFIT:
+                     fid = getBestFitBufferOrCreateNewIfNotExist(partition, actualSize);
+@@ -363,25 +370,13 @@ public class VPartitionTupleBufferManager implements IPartitionedTupleBufferMana
+                 case RANDOM_N:
+                     fid = getRandomFitBufferOrCreateNewIfNotExist(partition, actualSize, this.insertionParams[0]);
+                     break;
+-                //                case MTRANDOM_N:
+-                //                    fid = getRandomFitBufferMersenneTwisterFastOrCreateNewIfNotExist(partition, actualSize,
+-                //                            this.insertionParams[0]);
+-                //                    break;
+                 case RANDOM_N_CPP_ELEVEN:
+                     fid = getRandomFitBufferCPPElevenOrCreateNewIfNotExist(partition, actualSize,
+                             this.insertionParams[0]);
+                     break;
+-                //                case RANDOM_XORSHIFT64:
+-                //                    fid = getRandomFitBufferXORSHIFT64OrCreateNewIfNotExist(partition, actualSize,
+-                //                            this.insertionParams[0]);
+-                //                    break;
+                 case RANDOM_N_NO_FF:
+                     fid = getRandomFitBufferNOFFOrCreateNewIfNotExist(partition, actualSize, this.insertionParams[0]);
+                     break;
+-                //                case RANDOM_BEST_PARAM:
+-                //                    fid = getRandomFitBufferBestParamOrCreateNewIfNotExist(partition, actualSize,
+-                //                            this.insertionParams[0]);
+-                //                    break;
+                 case NEXTFIT:
+                     fid = nextFitDS.getNextFitBufferOrCreateNewIfNotExist(partition, actualSize);
+                     break;
+@@ -506,14 +501,13 @@ public class VPartitionTupleBufferManager implements IPartitionedTupleBufferMana
+         }
+ 
+         int limit = checkNFrames <= 0 ? 0 : Math.max(0, partitionArray[partition].getNumFrames() - checkNFrames);
+-
+         for (int index = partitionArray[partition].getNumFrames() - 1; index >= limit; index--) {
+             totalFramesChecked++;
+             if (partitionArray[partition].getFreeSpace(index) >= actualSize) {
+                 return index;
+             }
+         }
+-        return createNewBuffer(partition, actualSize);
++        return partitionArray[partition].getNumFrames() - 1;
+     }
+ 
+     private int getFirstFitBufferOrCreateNewIfNotExist(int partition, int actualSize, int checkNFrames)
+diff --git a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/group/HashSpillableTableFactory.java b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/group/HashSpillableTableFactory.java
+index 2f2b442..37c704b 100644
+--- a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/group/HashSpillableTableFactory.java
++++ b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/group/HashSpillableTableFactory.java
+@@ -159,8 +159,8 @@ public class HashSpillableTableFactory implements ISpillableTableFactory {
+ 
+             final ITuplePointerAccessor bufferAccessor = bufferManager.getTuplePointerAccessor(outRecordDescriptor);
+ 
+-            private final PreferToSpillFullyOccupiedFramePolicy spillPolicy =
+-                    new PreferToSpillFullyOccupiedFramePolicy(bufferManager, spilledSet);
++            private final PreferToSpillFullyOccupiedFramePolicy spillPolicy = new PreferToSpillFullyOccupiedFramePolicy(
++                    bufferManager, spilledSet, PreferToSpillFullyOccupiedFramePolicy.VICTIM.LARGEST_SIZE_SELF);
+ 
+             private final FrameTupleAppender outputAppender = new FrameTupleAppender(new VSizeFrame(ctx));
+ 
+@@ -309,7 +309,7 @@ public class HashSpillableTableFactory implements ISpillableTableFactory {
+             public int findVictimPartition(IFrameTupleAccessor accessor, int tIndex) throws HyracksDataException {
+                 int entryInHashTable = tpc.partition(accessor, tIndex, tableSize);
+                 int partition = getPartition(entryInHashTable);
+-                return spillPolicy.selectVictimPartition(partition);
++                return spillPolicy.selectVictimPartition(partition, -1);
+             }
+         };
+     }
+diff --git a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/OptimizedHybridHashJoin.java b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/OptimizedHybridHashJoin.java
+index 02455f5..7f87af8 100644
+--- a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/OptimizedHybridHashJoin.java
++++ b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/OptimizedHybridHashJoin.java
+@@ -20,6 +20,7 @@ package org.apache.hyracks.dataflow.std.join;
+ 
+ import java.nio.ByteBuffer;
+ import java.util.BitSet;
++import java.util.function.IntUnaryOperator;
+ 
+ import org.apache.hyracks.api.comm.IFrame;
+ import org.apache.hyracks.api.comm.IFrameWriter;
+@@ -31,7 +32,6 @@ import org.apache.hyracks.api.dataflow.value.IPredicateEvaluator;
+ import org.apache.hyracks.api.dataflow.value.ITuplePairComparator;
+ import org.apache.hyracks.api.dataflow.value.ITuplePartitionComputer;
+ import org.apache.hyracks.api.dataflow.value.RecordDescriptor;
+-import org.apache.hyracks.api.exceptions.ErrorCode;
+ import org.apache.hyracks.api.exceptions.HyracksDataException;
+ import org.apache.hyracks.api.io.FileReference;
+ import org.apache.hyracks.api.util.CleanupUtils;
+@@ -102,14 +102,19 @@ public class OptimizedHybridHashJoin {
+     private JoinStats probeStats;
+     private VPartitionTupleBufferManager.INSERTION dataInsertion;
+     private double[] insertionParams;
++    private PreferToSpillFullyOccupiedFramePolicy.VICTIM victim;
++    private boolean GrowSteal;
++    public int randomWritesInFrames;//SHIVA--print out
++    public int seqWritesInFrames;
++    private long buildSize;
+ 
+     public OptimizedHybridHashJoin(IHyracksJobletContext jobletCtx, int memSizeInFrames, int numOfPartitions,
+             String probeRelName, String buildRelName, RecordDescriptor probeRd, RecordDescriptor buildRd,
+             ITuplePartitionComputer probeHpc, ITuplePartitionComputer buildHpc, IPredicateEvaluator predEval,
+             boolean isLeftOuter, IMissingWriterFactory[] nullWriterFactories1,
+-            VPartitionTupleBufferManager.INSERTION insertion, double[] insertionParams) {
++            VPartitionTupleBufferManager.INSERTION insertion, double[] insertionParams,
++            PreferToSpillFullyOccupiedFramePolicy.VICTIM victim, boolean GrowSteal, long buildSize) {
+         this.jobletCtx = jobletCtx;
+-
+         this.memSizeInFrames = memSizeInFrames;
+         this.buildRd = buildRd;
+         this.probeRd = probeRd;
+@@ -131,6 +136,9 @@ public class OptimizedHybridHashJoin {
+         this.nonMatchWriters = isLeftOuter ? new IMissingWriter[nullWriterFactories1.length] : null;
+         this.dataInsertion = insertion;
+         this.insertionParams = insertionParams;
++        this.victim = victim;
++        this.GrowSteal = GrowSteal;
++        this.buildSize = buildSize;
+         if (isLeftOuter) {
+             for (int i = 0; i < nullWriterFactories1.length; i++) {
+                 nonMatchWriters[i] = nullWriterFactories1[i].createMissingWriter();
+@@ -146,8 +154,12 @@ public class OptimizedHybridHashJoin {
+         bufferManager = new VPartitionTupleBufferManager(
+                 PreferToSpillFullyOccupiedFramePolicy.createAtMostOneFrameForSpilledPartitionConstrain(spilledStatus),
+                 numOfPartitions, framePool, spilledStatus);
++        //TODO(Shiva): Include grow steal
++        //        if (GrowSteal) {
++        //            bufferManager.setConstrain(VPartitionTupleBufferManager.NO_CONSTRAIN);
++        //        }
+         bufferManager.setDataInsertion(dataInsertion, insertionParams);
+-        spillPolicy = new PreferToSpillFullyOccupiedFramePolicy(bufferManager, spilledStatus);
++        spillPolicy = new PreferToSpillFullyOccupiedFramePolicy(bufferManager, spilledStatus, victim);
+         spilledStatus.clear();
+         buildPSizeInTups = new int[numOfPartitions];
+     }
+@@ -155,16 +167,11 @@ public class OptimizedHybridHashJoin {
+     public void build(ByteBuffer buffer) throws HyracksDataException {
+         accessorBuild.reset(buffer);
+         int tupleCount = accessorBuild.getTupleCount();
+-        int tupleSize = accessorBuild.getTupleLength(0);
+-        int fieldCount = accessorBuild.getFieldCount();
+-        int fieldOneLength = accessorBuild.getFieldLength(0, 0);
+-        int fieldTwoLength = accessorBuild.getFieldLength(0, 1);
+         for (int i = 0; i < tupleCount; ++i) {
+             int pid = buildHpc.partition(accessorBuild, i, numOfPartitions);
+             processTupleBuildPhase(i, pid);
+             buildPSizeInTups[pid]++;
+         }
+-
+     }
+ 
+     private void processTupleBuildPhase(int tid, int pid) throws HyracksDataException {
+@@ -173,13 +180,14 @@ public class OptimizedHybridHashJoin {
+             int recordSize = VPartitionTupleBufferManager.calculateActualSize(null, accessorBuild.getTupleLength(tid));
+             double numFrames = (double) recordSize / (double) jobletCtx.getInitialFrameSize();
+             int victimPartition;
++            long remainig = getRemainingSize();
+             if (numFrames > bufferManager.getConstrain().frameLimit(pid)
+-                    || (victimPartition = spillPolicy.selectVictimPartition(pid)) < 0) {
++                    || (victimPartition = spillPolicy.selectVictimPartition(pid, remainig)) < 0) {
+                 // insert request can never be satisfied
+                 if (numFrames > memSizeInFrames || recordSize < jobletCtx.getInitialFrameSize()) {
+                     // the tuple is greater than the memory budget or although the record is small we could not find
+                     // a frame for it (possibly due to a bug)
+-                    throw HyracksDataException.create(ErrorCode.INSUFFICIENT_MEMORY);
++                    throw new HyracksDataException("Insufficient memory for join. Please assign more memory.");
+                 }
+                 // Record is large but insertion failed either 1) we could not satisfy the request because of the
+                 // frame limit or 2) we could not find a victim anymore (exhaused all victims) and the partition is
+@@ -195,11 +203,80 @@ public class OptimizedHybridHashJoin {
+                 }
+                 return;
+             }
++
+             spillPartition(victimPartition);
+         }
+     }
+ 
++    private void processLargeObjectBuildPhase(int tid, int pid, int actualSize) throws HyracksDataException {
++        int frameSize = jobletCtx.getInitialFrameSize();
++        if (actualSize > memSizeInFrames * frameSize) {
++            throw new HyracksDataException(
++                    "Record is larger than the join memory, please assign more memory to hash-join.");
++        }
++        if (spilledStatus.get(pid)) { //spilled
++            int vicim = spillPolicy.selectSpilledVictimPartition(pid, frameSize);
++            if (vicim > 0 && bufferManager.getPhysicalSize(vicim) > actualSize) {
++                spillPartition(pid);
++                if (!bufferManager.insertTuple(pid, accessorBuild, tid, tempPtr)) {
++                    flushBigObjectToDisk(pid, accessorBuild, tid, buildRFWriters, buildRelName);
++                }
++            } else {
++                flushBigObjectToDisk(pid, accessorBuild, tid, buildRFWriters, buildRelName);
++            }
++        } else { //in memory
++            if (actualSize > getTotalSize(i -> spilledStatus.nextSetBit(i))) {
++                flushBigObjectToDisk(pid, accessorBuild, tid, buildRFWriters, buildRelName);
++                spilledStatus.set(pid);
++            } else {
++                while (!bufferManager.insertTuple(pid, accessorBuild, tid, tempPtr)) {
++                    int victim = spillPolicy.selectSpilledVictimPartition(pid, frameSize);
++                    if (victim >= 0) {
++                        spillPartition(victim);
++                    } else {
++                        flushBigObjectToDisk(pid, accessorBuild, tid, buildRFWriters, buildRelName);
++                        spilledStatus.set(pid);
++                        break;
++                    }
++                }
++            }
++        }
++    }
++
++    private long getTotalSize(IntUnaryOperator next) {
++        long totalSize = 0;
++        for (int pid = spilledStatus.nextSetBit(0); pid >= 0 && pid < numOfPartitions; pid =
++                spilledStatus.nextSetBit(pid + 1)) {
++            totalSize += bufferManager.getPhysicalSize(pid);
++        }
++        return totalSize;
++    }
++
++    private long getTotalFrames(IntUnaryOperator next) {
++        long totalSize = 0;
++        for (int pid = spilledStatus.nextSetBit(0); pid >= 0 && pid < numOfPartitions; pid =
++                spilledStatus.nextSetBit(pid + 1)) {
++            totalSize += bufferManager.getNumberOfFrames(pid);
++        }
++        return totalSize;
++    }
++
++    private long getRemainingSize() {
++        if (buildSize <= 0) {
++            return -1;
++        }
++        long inMemorySize = 0;
++        for (int i = spilledStatus.nextClearBit(0); i < bufferManager.getNumPartitions() && i >= 0; i =
++                spilledStatus.nextClearBit(i + 1)) {
++            inMemorySize += bufferManager.getNumberOfFrames(i);
++        }
++
++        return buildSize - getTotalFrames(i -> spilledStatus.nextSetBit(i)) - inMemorySize;
++    }
++
+     private void spillPartition(int pid) throws HyracksDataException {
++        randomWritesInFrames += 1;
++        seqWritesInFrames += bufferManager.getNumberOfFrames(pid) - 1;
+         RunFileWriter writer = getSpillWriterOrCreateNewOneIfNotExist(buildRFWriters, buildRelName, pid);
+         bufferManager.flushPartition(pid, writer, true);
+         bufferManager.clearPartition(pid);
+@@ -522,7 +599,6 @@ public class OptimizedHybridHashJoin {
+     }
+ 
+     private void processTupleProbePhase(int tupleId, int pid) throws HyracksDataException {
+-
+         if (!bufferManager.insertTuple(pid, accessorProbe, tupleId, tempPtr)) {
+             int recordSize =
+                     VPartitionTupleBufferManager.calculateActualSize(null, accessorProbe.getTupleLength(tupleId));
+diff --git a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/OptimizedHybridHashJoinOperatorDescriptor.java b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/OptimizedHybridHashJoinOperatorDescriptor.java
+index bc8af38..833030d 100644
+--- a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/OptimizedHybridHashJoinOperatorDescriptor.java
++++ b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/OptimizedHybridHashJoinOperatorDescriptor.java
+@@ -61,6 +61,7 @@ import org.apache.hyracks.dataflow.std.buffermanager.DeallocatableFramePool;
+ import org.apache.hyracks.dataflow.std.buffermanager.FramePoolBackedFrameBufferManager;
+ import org.apache.hyracks.dataflow.std.buffermanager.IDeallocatableFramePool;
+ import org.apache.hyracks.dataflow.std.buffermanager.ISimpleFrameBufferManager;
++import org.apache.hyracks.dataflow.std.buffermanager.PreferToSpillFullyOccupiedFramePolicy;
+ import org.apache.hyracks.dataflow.std.buffermanager.VPartitionTupleBufferManager;
+ import org.apache.hyracks.dataflow.std.structures.ISerializableTable;
+ import org.apache.hyracks.dataflow.std.structures.SerializableHashTable;
+@@ -146,6 +147,8 @@ public class OptimizedHybridHashJoinOperatorDescriptor extends AbstractOperatorD
+     private boolean forceRoleReversal = false;
+     private VPartitionTupleBufferManager.INSERTION insertion;
+     private double[] insertionParams;
++    private PreferToSpillFullyOccupiedFramePolicy.VICTIM victim;
++    private boolean GrowSteal;
+     private boolean shivasLog = true;//make it false for HDD
+ 
+     private static final Logger LOGGER = LogManager.getLogger();
+@@ -157,7 +160,8 @@ public class OptimizedHybridHashJoinOperatorDescriptor extends AbstractOperatorD
+             ITuplePairComparatorFactory tupPaircomparatorFactory01,
+             ITuplePairComparatorFactory tupPaircomparatorFactory10, IPredicateEvaluatorFactory predEvaluatorFactory,
+             boolean isLeftOuter, IMissingWriterFactory[] nonMatchWriterFactories,
+-            VPartitionTupleBufferManager.INSERTION insertion, double[] insertionParams) {
++            VPartitionTupleBufferManager.INSERTION insertion, double[] insertionParams,
++            PreferToSpillFullyOccupiedFramePolicy.VICTIM victim, boolean GrowSteal) {
+         super(spec, 2, 1);
+         this.memSizeInFrames = memSizeInFrames;
+         this.inputsize0 = inputsize0;
+@@ -177,10 +181,11 @@ public class OptimizedHybridHashJoinOperatorDescriptor extends AbstractOperatorD
+         this.probeStats = new JoinStats();
+         this.insertion = insertion;
+         this.insertionParams = insertionParams;
++        this.victim = victim;
++        this.GrowSteal = GrowSteal;
+         LOGGER.warn(
+                 "Algo,FrameCheckPercentage,Threshold,TotalBudget,spilled_fullness,inMemory_fullness, spilled_frames,"
+                         + "inMemory_frames,ReservedFrames_For_Spilled,Gap,#framesChecked,#repetetivelyCheckedFrames");
+-
+     }
+ 
+     public OptimizedHybridHashJoinOperatorDescriptor(IOperatorDescriptorRegistry spec, int memSizeInFrames,
+@@ -191,7 +196,8 @@ public class OptimizedHybridHashJoinOperatorDescriptor extends AbstractOperatorD
+             ITuplePairComparatorFactory tupPaircomparatorFactory10, IPredicateEvaluatorFactory predEvaluatorFactory) {
+         this(spec, memSizeInFrames, inputsize0, 0, factor, keys0, keys1, propHashFunctionFactories,
+                 buildHashFunctionFactories, recordDescriptor, tupPaircomparatorFactory01, tupPaircomparatorFactory10,
+-                predEvaluatorFactory, false, null, VPartitionTupleBufferManager.INSERTION.APPEND, new double[2]);
++                predEvaluatorFactory, false, null, VPartitionTupleBufferManager.INSERTION.APPEND, new double[2],
++                PreferToSpillFullyOccupiedFramePolicy.VICTIM.LARGEST_SIZE, false);
+     }
+ 
+     public OptimizedHybridHashJoinOperatorDescriptor(IOperatorDescriptorRegistry spec, int memSizeInFrames,
+@@ -204,18 +210,8 @@ public class OptimizedHybridHashJoinOperatorDescriptor extends AbstractOperatorD
+         this(spec, memSizeInFrames, inputsize0, 0, factor, keys0, keys1, propHashFunctionFactories,
+                 buildHashFunctionFactories, recordDescriptor, tupPaircomparatorFactory01, tupPaircomparatorFactory10,
+                 predEvaluatorFactory, isLeftOuter, nonMatchWriterFactories,
+-                VPartitionTupleBufferManager.INSERTION.APPEND, new double[2]);
+-    }
+-
+-    public OptimizedHybridHashJoinOperatorDescriptor(IOperatorDescriptorRegistry spec, int memSizeInFrames,
+-            int inputsize0, int numOfPartitions, double factor, int[] keys0, int[] keys1,
+-            IBinaryHashFunctionFamily[] propHashFunctionFactories,
+-            IBinaryHashFunctionFamily[] buildHashFunctionFactories, RecordDescriptor recordDescriptor,
+-            ITuplePairComparatorFactory tupPaircomparatorFactory01,
+-            ITuplePairComparatorFactory tupPaircomparatorFactory10, IPredicateEvaluatorFactory predEvaluatorFactory) {
+-        this(spec, memSizeInFrames, inputsize0, numOfPartitions, factor, keys0, keys1, propHashFunctionFactories,
+-                buildHashFunctionFactories, recordDescriptor, tupPaircomparatorFactory01, tupPaircomparatorFactory10,
+-                predEvaluatorFactory, false, null, VPartitionTupleBufferManager.INSERTION.APPEND, new double[2]);
++                VPartitionTupleBufferManager.INSERTION.APPEND, new double[2],
++                PreferToSpillFullyOccupiedFramePolicy.VICTIM.LARGEST_SIZE, false);
+     }
+ 
+     public OptimizedHybridHashJoinOperatorDescriptor(IOperatorDescriptorRegistry spec, int memSizeInFrames,
+@@ -224,10 +220,11 @@ public class OptimizedHybridHashJoinOperatorDescriptor extends AbstractOperatorD
+             IBinaryHashFunctionFamily[] buildHashFunctionFactories, RecordDescriptor recordDescriptor,
+             ITuplePairComparatorFactory tupPaircomparatorFactory01,
+             ITuplePairComparatorFactory tupPaircomparatorFactory10, IPredicateEvaluatorFactory predEvaluatorFactory,
+-            VPartitionTupleBufferManager.INSERTION insertion, double[] insertionParams) {
++            VPartitionTupleBufferManager.INSERTION insertion, double[] insertionParams,
++            PreferToSpillFullyOccupiedFramePolicy.VICTIM victim, boolean GrowSteal) {
+         this(spec, memSizeInFrames, inputsize0, numOfPartitions, factor, keys0, keys1, propHashFunctionFactories,
+                 buildHashFunctionFactories, recordDescriptor, tupPaircomparatorFactory01, tupPaircomparatorFactory10,
+-                predEvaluatorFactory, false, null, insertion, insertionParams);
++                predEvaluatorFactory, false, null, insertion, insertionParams, victim, GrowSteal);
+     }
+ 
+     @Override
+@@ -354,7 +351,8 @@ public class OptimizedHybridHashJoinOperatorDescriptor extends AbstractOperatorD
+                             fudgeFactor, nPartitions);
+                     state.hybridHJ = new OptimizedHybridHashJoin(ctx.getJobletContext(), state.memForJoin,
+                             state.numOfPartitions, PROBE_REL, BUILD_REL, probeRd, buildRd, probeHpc, buildHpc,
+-                            predEvaluator, isLeftOuter, nonMatchWriterFactories, insertion, insertionParams);
++                            predEvaluator, isLeftOuter, nonMatchWriterFactories, insertion, insertionParams, victim,
++                            GrowSteal, inputsize0);
+ 
+                     state.hybridHJ.initBuild();
+                     if (LOGGER.isTraceEnabled()) {
+@@ -376,12 +374,10 @@ public class OptimizedHybridHashJoinOperatorDescriptor extends AbstractOperatorD
+                             LOGGER.warn("BC-" + Thread.currentThread().getId());
+                             state.hybridHJ.closeBuild();
+                             if (shivasLog) {
+-                                try {
+-                                    LOGGER.warn(state.hybridHJ.printProfiling());
+-                                    state.sb = "RESULT:";
+-                                } catch (IOException e) {
+-                                    e.printStackTrace();
+-                                }
++                                LOGGER.warn(state.hybridHJ.printProfiling());
++                                LOGGER.warn(state.hybridHJ.printPartitionInfo(OptimizedHybridHashJoin.SIDE.BUILD));
++                                LOGGER.warn("SeqWritesInBuild: " + state.hybridHJ.seqWritesInFrames
++                                        + " RandWritesInBuild: " + state.hybridHJ.randomWritesInFrames + "\n");
+                             }
+                             ctx.setStateObject(state);
+                             if (LOGGER.isTraceEnabled()) {
+@@ -637,7 +633,8 @@ public class OptimizedHybridHashJoinOperatorDescriptor extends AbstractOperatorD
+                             }
+                             //Probe Side is smaller
+                             applyInMemHashJoin(probeKeys, buildKeys, tabSize, probeRd, buildRd, probeHpc, buildHpc,
+-                                    probeSideReader, buildSideReader, buildComp); // checked-confirmed
++                                    probeSideReader, buildSideReader, buildComp); // checked
++                            // -confirmed
+                         }
+                     }
+                     //Apply (Recursive) HHJ
+@@ -685,7 +682,7 @@ public class OptimizedHybridHashJoinOperatorDescriptor extends AbstractOperatorD
+                             nPartitions);
+                     rHHj = new OptimizedHybridHashJoin(jobletCtx, state.memForJoin, n, PROBE_REL, BUILD_REL, probeRd,
+                             buildRd, probeHpc, buildHpc, predEvaluator, isLeftOuter, nonMatchWriterFactories, insertion,
+-                            insertionParams);
++                            insertionParams, victim, GrowSteal, tableSize);
+                     //checked-confirmed
+ 
+                     state.partitionJoins.add(rHHj);
+diff --git a/hyracks-fullstack/hyracks/hyracks-examples/hyracks-integration-tests/src/test/java/org/apache/hyracks/tests/integration/OptimizedHybridHashJoinTest.java b/hyracks-fullstack/hyracks/hyracks-examples/hyracks-integration-tests/src/test/java/org/apache/hyracks/tests/integration/OptimizedHybridHashJoinTest.java
+index 2cf827a..09697f6 100644
+--- a/hyracks-fullstack/hyracks/hyracks-examples/hyracks-integration-tests/src/test/java/org/apache/hyracks/tests/integration/OptimizedHybridHashJoinTest.java
++++ b/hyracks-fullstack/hyracks/hyracks-examples/hyracks-integration-tests/src/test/java/org/apache/hyracks/tests/integration/OptimizedHybridHashJoinTest.java
+@@ -40,6 +40,7 @@ import org.apache.hyracks.dataflow.common.data.marshalling.IntegerSerializerDese
+ import org.apache.hyracks.dataflow.common.data.marshalling.UTF8StringSerializerDeserializer;
+ import org.apache.hyracks.dataflow.common.data.partition.FieldHashPartitionComputerFamily;
+ import org.apache.hyracks.dataflow.common.utils.TupleUtils;
++import org.apache.hyracks.dataflow.std.buffermanager.PreferToSpillFullyOccupiedFramePolicy;
+ import org.apache.hyracks.dataflow.std.buffermanager.VPartitionTupleBufferManager;
+ import org.apache.hyracks.dataflow.std.join.OptimizedHybridHashJoin;
+ import org.apache.hyracks.dataflow.std.structures.SerializableHashTable;
+@@ -153,7 +154,7 @@ public class OptimizedHybridHashJoinTest {
+ 
+         hhj = new OptimizedHybridHashJoin(ctx, memSizeInFrames, numOfPartitions, probeRelName, buildRelName, probeRd,
+                 buildRd, probeHpc, buildHpc, predEval, isLeftOuter, null, VPartitionTupleBufferManager.INSERTION.APPEND,
+-                null);
++                null, PreferToSpillFullyOccupiedFramePolicy.VICTIM.LARGEST_SIZE, false, -1);
+ 
+         hhj.initBuild();
+ 
+-- 
+2.10.1
+
